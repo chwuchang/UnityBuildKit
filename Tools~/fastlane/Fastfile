@@ -1,0 +1,680 @@
+# BuildKit —— fastlane 编排：Unity 构建 → 签名导出 → 上传商店 → 打 tag → 通知
+#
+#   bundle exec fastlane check                    # 只检查环境和配置
+#   bundle exec fastlane android build            # Android：构建 AAB + 上传 Google Play
+#   bundle exec fastlane ios build                # iOS：导出 Xcode 工程 + 签名出 ipa + 上传 TestFlight（只能在 Mac 上）
+#   bundle exec fastlane all                      # 双端：先把两端都构建好，再统一上传
+#   bundle exec fastlane upload only:ios          # 重新上传最近一次构建的包（上传失败时用，不用重打）
+#
+#   追加 profile:dev      使用 buildkit.json 里的 dev profile（默认用 defaultProfile）
+#   追加 upload:false     只出包不上传
+#   追加 allow_dirty:true 使用独立打包目录时，主项目有未提交改动也继续（只打包已提交的内容）
+require "json"
+require "fileutils"
+require "shellwords"
+require "open3"
+require "time"
+require "net/http"
+require "uri"
+
+Encoding.default_external = Encoding::UTF_8
+
+KIT  = File.expand_path("..", __dir__)
+ROOT = File.expand_path("..", KIT)
+MAC  = RUBY_PLATFORM.include?("darwin")
+WIN  = Gem.win_platform?
+
+# Windows 记事本等编辑器可能存成带 BOM 的 UTF-8，Ruby 的 JSON.parse 遇到 BOM 会直接报错
+def read_json(path)
+  JSON.parse(File.read(path, encoding: "bom|utf-8"))
+rescue JSON::ParserError => e
+  UI.user_error!("#{path} 格式错误（JSON 不能写注释、末尾不能多逗号）：#{e.message}")
+end
+
+RAW_CFG = read_json(File.join(KIT, "buildkit.json"))
+SECRETS_FILE = File.join(KIT, "secrets", "secrets.json")
+SEC = File.exist?(SECRETS_FILE) ? read_json(SECRETS_FILE) : {}
+
+opt_out_usage
+
+# ───────────── 配置 / profile ─────────────
+# 规则和 Unity 里的 ConfigLoader.Resolve 一致：顶层设置 + profiles[name] 覆盖；
+# 对象逐字段深度合并，数组和普通值整体替换。缺省值和 C# 里的字段默认值一致。
+
+DEFAULTS = {
+  "outputDir" => "Build",
+  "git" => { "requireClean" => false, "tagOnUpload" => false, "pushTag" => false },
+  "android" => { "format" => "aab", "keystoreFile" => "secrets/release.keystore", "uploadToPlay" => true,
+                 "playTrack" => "internal", "playReleaseStatus" => "draft" },
+  "ios" => { "minXcode" => "26.0", "exportMethod" => "app-store", "uploadToTestFlight" => true },
+  "notify" => { "onSuccess" => true, "onFailure" => true },
+  "hooks" => { "postBuild" => "", "postUpload" => "" }
+}.freeze
+
+$bk_profile = nil   # 由 before_all / upload lane 设置
+
+def deep_merge(a, b)
+  a.merge(b) { |_, x, y| x.is_a?(Hash) && y.is_a?(Hash) ? deep_merge(x, y) : y }
+end
+
+def resolve_config(profile)
+  name = [profile, ENV["BK_PROFILE"], RAW_CFG["defaultProfile"]].map(&:to_s).find { |s| !s.empty? } || ""
+  merged = RAW_CFG.reject { |k, _| k == "profiles" }
+  unless name.empty?
+    profiles = RAW_CFG["profiles"].is_a?(Hash) ? RAW_CFG["profiles"] : {}
+    unless profiles[name].is_a?(Hash)
+      UI.user_error!("没有名为「#{name}」的 profile，可用：#{profiles.empty? ? '（没有定义任何 profile）' : profiles.keys.join(' / ')}")
+    end
+    merged = deep_merge(merged, profiles[name])
+  end
+  deep_merge(DEFAULTS, merged).merge("_profile" => name)
+end
+
+def cfg
+  @cfg_cache ||= {}
+  @cfg_cache[$bk_profile.to_s] ||= resolve_config($bk_profile)
+end
+
+def profile_name
+  cfg["_profile"]
+end
+
+# ───────────── 工具函数 ─────────────
+
+def sec(key, env)
+  ENV[env].to_s.empty? ? SEC[key].to_s : ENV[env]
+end
+
+def kit_path(p)
+  p.to_s.empty? ? "" : File.expand_path(p, KIT)
+end
+
+def out_dir
+  File.expand_path(cfg["outputDir"] || "Build", ROOT)
+end
+
+def upload?(opts, default)
+  v = opts[:upload]
+  v.nil? ? !!default : v.to_s == "true"
+end
+
+def safe_name(s)
+  s.to_s.gsub(/[^\p{L}\p{N}.\-]/, "_")
+end
+
+# 和 C# 的 Builder.ArtifactName 一致：1.2.0_1450123_dev
+def artifact_stem(bn)
+  s = "#{cfg['version']}_#{bn}"
+  profile_name.empty? ? s : "#{s}_#{safe_name(profile_name)}"
+end
+
+def unity_version
+  File.read(File.join(ROOT, "ProjectSettings", "ProjectVersion.txt"))[/m_EditorVersion:\s*(\S+)/, 1]
+end
+
+def hub_secondary_install_path
+  f = if MAC then File.join(Dir.home, "Library", "Application Support", "UnityHub", "secondaryInstallPath.json")
+      elsif WIN then File.join(ENV["APPDATA"].to_s, "UnityHub", "secondaryInstallPath.json")
+      end
+  return nil unless f && File.exist?(f)
+  p = JSON.parse(File.read(f, encoding: "bom|utf-8")) rescue nil
+  p.is_a?(String) && !p.empty? ? p : nil
+end
+
+def unity_path
+  explicit = sec("unityPath", "UNITY_PATH")
+  return explicit unless explicit.empty?
+  v = unity_version
+  roots = []
+  if MAC
+    roots += ["/Applications/Unity/Hub/Editor", "#{Dir.home}/Applications/Unity/Hub/Editor"]
+  elsif WIN
+    roots << File.join(ENV["ProgramFiles"] || "C:/Program Files", "Unity", "Hub", "Editor")
+  else
+    roots << "#{Dir.home}/Unity/Hub/Editor"
+  end
+  roots << hub_secondary_install_path if hub_secondary_install_path
+  exe = MAC ? "Unity.app/Contents/MacOS/Unity" : (WIN ? "Editor/Unity.exe" : "Editor/Unity")
+  roots.map { |r| File.join(r, v, exe) }.find { |c| File.exist?(c) }
+end
+
+# Mac：Unity.app/Contents/MacOS/Unity → <编辑器>/PlaybackEngines/xxx
+# Windows：Editor/Unity.exe → Editor/Data/PlaybackEngines/xxx
+def unity_module?(name)
+  u = unity_path
+  return false unless u
+  dir = MAC ? File.join(File.expand_path("../../../..", u), "PlaybackEngines", name)
+            : File.join(File.dirname(u), "Data", "PlaybackEngines", name)
+  Dir.exist?(dir)
+end
+
+def build_number_minutes
+  ((Time.now.utc - Time.utc(2024, 1, 1)) / 60).to_i
+end
+
+def asc_key
+  @asc_key ||= app_store_connect_api_key(
+    key_id: sec("ascKeyId", "BK_ASC_KEY_ID"),
+    issuer_id: sec("ascIssuerId", "BK_ASC_ISSUER_ID"),
+    key_filepath: kit_path(sec("ascKeyFile", "BK_ASC_KEY_FILE"))
+  )
+end
+
+def play_json_key
+  kit_path(sec("playJsonKeyFile", "BK_PLAY_JSON"))
+end
+
+def xcode_version
+  out, st = Open3.capture2e("xcodebuild", "-version")
+  st.success? ? out[/Xcode\s+([\d.]+)/, 1] : nil
+rescue SystemCallError
+  nil
+end
+
+def git_repo?(dir)
+  system("git", "-C", dir, "rev-parse", "--git-dir", out: File::NULL, err: File::NULL)
+end
+
+def run_git(dir, *args, env: {})
+  out, status = Open3.capture2e(env, "git", "-C", dir, *args)
+  UI.user_error!("git #{args.join(' ')} 失败（#{dir}）：\n#{out}") unless status.success?
+  out.strip
+end
+
+def head_commit(short: true)
+  return "" unless git_repo?(ROOT)
+  short ? run_git(ROOT, "rev-parse", "--short", "HEAD") : run_git(ROOT, "rev-parse", "HEAD")
+end
+
+def head_branch
+  return "" unless git_repo?(ROOT)
+  b = run_git(ROOT, "rev-parse", "--abbrev-ref", "HEAD")
+  b == "HEAD" ? "" : b
+end
+
+# ───────────── 独立打包目录 ─────────────
+# secrets.json 里配了 androidWorkspace / iosWorkspace（本机路径，不进 Git）后，Unity 会在那份单独的
+# checkout 里打包：
+#   - 不占用你正在开发的项目，打包时编辑器不用关
+#   - Android、iOS 各用一份，就不用来回切平台（每次切平台都要按新平台重新导入全部贴图，大项目要几十分钟）
+# 该目录完全由 BuildKit 管理，每次打包前会被强制同步到主项目当前的提交，不要在里面改东西。
+
+WORKSPACE_MARK = "buildkit-workspace"   # 放在 <打包目录>/.git/ 里，防止把普通项目当成打包目录强制覆盖
+
+def project_for(platform, opts)
+  ws = sec("#{platform}Workspace", "BK_#{platform.upcase}_WORKSPACE")
+  return ROOT if ws.empty?
+  ws = File.expand_path(ws, KIT)
+  sync_workspace(ws, opts)
+  ws
+end
+
+def sync_workspace(ws, opts)
+  UI.user_error!("主项目不是 git 仓库，无法使用独立打包目录") unless git_repo?(ROOT)
+  root_real = File.realpath(ROOT)
+  ws_real = File.exist?(ws) ? File.realpath(ws) : ws
+  if ws_real.casecmp?(root_real) || ws_real.downcase.start_with?(root_real.downcase + File::SEPARATOR)
+    UI.user_error!("独立打包目录必须在主项目文件夹之外：#{ws}")
+  end
+
+  dirty = run_git(ROOT, "status", "--porcelain")
+  unless dirty.empty?
+    msg = "主项目有未提交的改动，独立打包目录只会打包已提交的内容：\n#{dirty.lines.first(10).join}"
+    if opts[:allow_dirty].to_s == "true"
+      UI.important(msg)
+    else
+      UI.user_error!("#{msg}\n先提交，或加 allow_dirty:true 忽略")
+    end
+  end
+
+  mark = File.join(ws, ".git", WORKSPACE_MARK)
+  if !Dir.exist?(File.join(ws, ".git"))
+    UI.user_error!("#{ws} 已存在且不是 git 仓库，请换一个空目录") if Dir.exist?(ws) && !Dir.empty?(ws)
+    origin_out, st = Open3.capture2e("git", "-C", ROOT, "remote", "get-url", "origin")
+    source = st.success? ? origin_out.strip : ROOT
+    UI.message("首次使用，克隆独立打包目录：#{source} → #{ws}")
+    FileUtils.mkdir_p(File.dirname(ws))
+    out, st = Open3.capture2e("git", "clone", "--no-checkout", source, ws)
+    UI.user_error!("克隆失败：\n#{out}") unless st.success?
+    File.write(mark, "managed by BuildKit\n")
+  elsif !File.exist?(mark)
+    UI.user_error!("#{ws} 不是 BuildKit 创建的打包目录，为防止覆盖里面的改动，拒绝使用。\n" \
+                   "如果确认它是专用打包目录，创建空文件 #{mark} 后重试")
+  end
+
+  sha = run_git(ROOT, "rev-parse", "HEAD")
+  no_smudge = { "GIT_LFS_SKIP_SMUDGE" => "1" }
+  run_git(ws, "fetch", "--no-tags", ROOT, "HEAD", env: no_smudge)   # 直接从主项目取，没 push 的提交也能打
+  run_git(ws, "checkout", "--force", "--detach", sha, env: no_smudge)
+  run_git(ws, "clean", "-fd")   # 不带 -x：Library 等被 .gitignore 忽略的缓存会保留，这正是用独立目录的意义
+  run_git(ws, "submodule", "update", "--init", "--recursive") if File.exist?(File.join(ws, ".gitmodules"))
+  attrs = File.join(ws, ".gitattributes")
+  if File.exist?(attrs) && File.read(attrs).include?("filter=lfs")
+    out, st = Open3.capture2e("git", "-C", ws, "lfs", "pull")
+    UI.user_error!("Git LFS 文件拉取失败（新加的 LFS 文件需要先 push 到服务器）：\n#{out}") unless st.success?
+  end
+
+  # secrets 不进 Git，从主项目拷过去
+  ws_secrets = File.join(ws, "BuildKit", "secrets")
+  FileUtils.rm_rf(ws_secrets)
+  FileUtils.cp_r(File.join(KIT, "secrets"), ws_secrets) if Dir.exist?(File.join(KIT, "secrets"))
+
+  UI.success("独立打包目录已同步到 #{sha[0, 8]}：#{ws}")
+end
+
+# ───────────── Unity ─────────────
+
+def run_unity(platform, build_number, project)
+  unity = unity_path
+  UI.user_error!("找不到 Unity #{unity_version}") unless unity
+  log = File.join(KIT, "logs", "unity_#{platform}.log")
+  FileUtils.mkdir_p(File.dirname(log))
+  FileUtils.rm_f(log)
+
+  cmd = [unity, "-batchmode", "-projectPath", project,
+         "-buildTarget", platform == "ios" ? "iOS" : "Android",
+         "-executeMethod", "BuildKit.Builder.CLI",
+         "-bkPlatform", platform, "-bkBuildNumber", build_number.to_s,
+         "-bkOutputDir", out_dir,   # 在独立打包目录构建时，产物也放回主项目
+         "-logFile", log]
+  cmd += ["-bkProfile", profile_name] unless profile_name.empty?
+  # 独立打包目录里是 detached HEAD，分支名从主项目传进去（写进包里的构建信息用）
+  env = { "BK_GIT_BRANCH" => head_branch }
+
+  UI.header("Unity 构建 #{platform}（profile「#{profile_name}」，build #{build_number}），首次导入可能要很久")
+  UI.message("项目：#{project}")
+  UI.message("日志：#{log}")
+  ok = system(env, *cmd)
+  text = File.exist?(log) ? File.binread(log).force_encoding("UTF-8").scrub : ""
+
+  unless ok
+    hint = text.include?("another Unity instance") ?
+      "\n👉 项目正被 Unity 编辑器打开，请先关掉 Unity 再打包（或在 secrets.json 配置独立打包目录，见 README）" : ""
+    UI.user_error!("Unity 构建失败#{hint}\n----- 日志末尾 -----\n#{text.lines.last(60).join}")
+  end
+  out = text[/\[BuildKit\] OUTPUT=(.+)$/, 1]
+  UI.user_error!("日志里没找到产物路径，请查看 #{log}") unless out
+  out.strip
+end
+
+# ───────────── 环境自检（Unity 内部还有一轮配置自检） ─────────────
+
+def preflight(build_android: false, build_ios: false, upload_android: false, upload_ios: false)
+  rows = []
+  add = ->(ok, item, fix = "", warn: false) { rows << [ok ? "✅" : (warn ? "⚠️" : "❌"), item, ok ? "" : fix] }
+
+  if build_android || build_ios
+    add.(!unity_path.nil?, "Unity #{unity_version}", "用 Unity Hub 安装这个版本，或在 secrets.json 填 unityPath")
+    add.(File.exist?(SECRETS_FILE), "secrets/secrets.json", "复制 secrets.example/secrets.json 到 secrets/ 并填写")
+  end
+
+  if build_android
+    add.(unity_module?("AndroidPlayer"), "Unity Android 模块", "Unity Hub → 已安装 → 添加模块 → Android Build Support（含 SDK/NDK/OpenJDK）")
+    add.(File.exist?(kit_path(cfg.dig("android", "keystoreFile"))), "Android 签名文件", "把 release.keystore 放进 BuildKit/secrets/")
+    add.(!sec("keystorePassword", "BK_KEYSTORE_PASSWORD").empty?, "keystore 密码", "secrets.json 填 keystorePassword")
+    add.(!sec("keyAliasPassword", "BK_KEYALIAS_PASSWORD").empty?, "key alias 密码", "secrets.json 填 keyAliasPassword")
+  end
+  if upload_android
+    add.(File.exist?(play_json_key), "Google Play 服务账号 JSON", "见 README「Google Play 服务账号」")
+  end
+
+  if build_ios || upload_ios
+    UI.user_error!("iOS 只能在 Mac 上打包和上传（苹果的限制）") unless MAC
+  end
+  if build_ios
+    xv = xcode_version
+    min = cfg.dig("ios", "minXcode").to_s
+    add.(!xv.nil?, "Xcode", "App Store 安装 Xcode，打开一次同意协议，再执行 sudo xcode-select -s /Applications/Xcode.app")
+    if xv && !min.empty?
+      add.(Gem::Version.new(xv) >= Gem::Version.new(min), "Xcode #{xv}（App Store 要求 ≥ #{min}）",
+           "升级 Xcode；苹果每年春季提高上传要求。若要求有变，改 buildkit.json 的 ios.minXcode", warn: !upload_ios)
+    end
+    add.(unity_module?("iOSSupport"), "Unity iOS 模块", "Unity Hub → 添加模块 → iOS Build Support")
+    add.(cfg.dig("ios", "teamId").to_s.match?(/\A[A-Z0-9]{10}\z/), "Team ID", "buildkit.json 填 ios.teamId（10 位）")
+    if ENV["SSH_CONNECTION"]
+      add.(!sec("keychainPassword", "BK_KEYCHAIN_PASSWORD").empty?, "SSH 会话下解锁钥匙串",
+           "通过 SSH 打包时登录钥匙串是锁着的，codesign 会报 errSecInternalComponent。在 secrets.json 填 keychainPassword（本机登录密码）", warn: true)
+    end
+  end
+  if build_ios || upload_ios
+    add.(!sec("ascKeyId", "BK_ASC_KEY_ID").empty? && !sec("ascIssuerId", "BK_ASC_ISSUER_ID").empty?, "App Store Connect API Key ID / Issuer ID", "见 README「App Store Connect API Key」")
+    add.(File.exist?(kit_path(sec("ascKeyFile", "BK_ASC_KEY_FILE"))), "API Key 文件 .p8", "把 AuthKey_xxx.p8 放进 BuildKit/secrets/")
+  end
+
+  puts Terminal::Table.new(title: "BuildKit 环境检查（profile「#{profile_name}」）", headings: ["", "项目", "怎么修"], rows: rows)
+  UI.user_error!("环境检查未通过，按上表修好再来") if rows.any? { |r| r[0] == "❌" }
+  UI.success("环境检查通过")
+end
+
+# ───────────── build 号 ─────────────
+# 双端共用一个号（同一次发版两端号码一致，查问题时好对应），并且保证比商店里已有的都大。
+
+def play_latest_version_code
+  a = cfg["android"]
+  tracks = (%w[internal alpha beta production] + [a["playTrack"]]).compact.uniq
+  tracks.map do |track|
+    google_play_track_version_codes(package_name: a["packageName"], track: track, json_key: play_json_key).map(&:to_i).max.to_i
+  rescue StandardError => e
+    UI.important("读取 Google Play「#{track}」轨道的 versionCode 失败（服务账号权限 / 网络 / 轨道不存在？）：#{e.message}")
+    0
+  end.max
+end
+
+def testflight_latest_build_number
+  latest_testflight_build_number(api_key: asc_key, app_identifier: cfg.dig("ios", "bundleId"), initial_build_number: 0).to_i
+rescue StandardError => e
+  UI.important("查询 TestFlight 最新 build 号失败（App Store Connect 里还没建 App？）：#{e.message}")
+  0
+end
+
+def next_build_number(query_play:, query_testflight:)
+  candidates = [build_number_minutes]
+  candidates << play_latest_version_code + 1 if query_play
+  candidates << testflight_latest_build_number + 1 if query_testflight
+  candidates.max
+end
+
+# ───────────── 构建记录（上传失败时可以只重传，不用重打） ─────────────
+
+def manifest_path
+  File.join(out_dir, "last_build.json")
+end
+
+def read_manifest
+  File.exist?(manifest_path) ? read_json(manifest_path) : {}
+end
+
+def save_manifest_entry(platform, entry)
+  m = read_manifest
+  m[platform] = entry
+  FileUtils.mkdir_p(out_dir)
+  File.write(manifest_path, JSON.pretty_generate(m))
+end
+
+def new_entry(build_number, artifact, symbols)
+  {
+    "profile" => profile_name, "version" => cfg["version"], "buildNumber" => build_number,
+    "commit" => head_commit, "commitFull" => head_commit(short: false), "branch" => head_branch,
+    "builtAt" => Time.now.iso8601, "artifact" => artifact, "symbols" => symbols, "uploaded" => false
+  }
+end
+
+# ───────────── 扩展：shell hooks ─────────────
+# buildkit.json 的 hooks.postBuild / hooks.postUpload：在项目根目录执行，构建信息通过环境变量传入。
+
+def run_hook(name, platform, entry)
+  cmd = cfg.dig("hooks", name).to_s
+  return if cmd.empty?
+  env = {
+    "BK_PLATFORM" => platform, "BK_PROFILE" => entry["profile"].to_s, "BK_VERSION" => entry["version"].to_s,
+    "BK_BUILD_NUMBER" => entry["buildNumber"].to_s, "BK_ARTIFACT" => entry["artifact"].to_s,
+    "BK_SYMBOLS" => entry["symbols"].to_s, "BK_COMMIT" => entry["commit"].to_s, "BK_OUTPUT_DIR" => out_dir
+  }
+  UI.message("执行 hooks.#{name}：#{cmd}")
+  ok = system(env, cmd, chdir: ROOT)
+  UI.user_error!("hooks.#{name} 执行失败（退出码 #{$?&.exitstatus}）") unless ok
+end
+
+# ───────────── 通知 ─────────────
+# secrets.json 的 notifyWebhook。按地址自动识别：企业微信 / 钉钉 / 飞书 / Slack / Discord，其他地址按 {"text": ...} 发送。
+# 钉钉机器人如果开了"自定义关键词"安全设置，关键词填 BuildKit。
+
+def notify(ok, text)
+  url = sec("notifyWebhook", "BK_NOTIFY_WEBHOOK")
+  return if url.empty?
+  c = (cfg rescue DEFAULTS)
+  return if ok && !c.dig("notify", "onSuccess")
+  return if !ok && !c.dig("notify", "onFailure")
+  content = "[BuildKit] #{ok ? '✅' : '❌'} #{c['productName']} #{text}"
+  body = case url
+         when /qyapi\.weixin\.qq\.com/, /oapi\.dingtalk\.com/ then { msgtype: "text", text: { content: content } }
+         when /open\.(feishu\.cn|larksuite\.com)/ then { msg_type: "text", content: { text: content } }
+         when %r{discord(app)?\.com/api/webhooks} then { content: content }
+         else { text: content }
+         end
+  res = Net::HTTP.post(URI(url), body.to_json, "Content-Type" => "application/json")
+  UI.important("通知发送失败：HTTP #{res.code} #{res.body}") unless res.is_a?(Net::HTTPSuccess)
+rescue StandardError => e
+  UI.important("通知发送失败：#{e.message}")
+end
+
+def summary_line(results)
+  results.map { |p, e| "#{p} #{e['version']} (#{e['buildNumber']})#{e['uploaded'] ? ' 已上传' : ''}" }.join("，")
+end
+
+# ───────────── git tag ─────────────
+
+def tag_release(entries)
+  return unless cfg.dig("git", "tagOnUpload") && git_repo?(ROOT)
+  e = entries.first
+  return if e.nil? || e["commitFull"].to_s.empty?
+  tag = "v#{e['version']}-#{e['buildNumber']}"
+  if system("git", "-C", ROOT, "rev-parse", "-q", "--verify", "refs/tags/#{tag}", out: File::NULL, err: File::NULL)
+    UI.message("tag #{tag} 已存在，跳过")
+    return
+  end
+  platforms = entries.map { |x| x["platform"] }.compact.join("+")
+  run_git(ROOT, "tag", "-a", tag, e["commitFull"], "-m", "BuildKit #{platforms} #{e['version']} (#{e['buildNumber']}) profile=#{e['profile']}")
+  UI.success("已打 tag：#{tag}")
+  return unless cfg.dig("git", "pushTag")
+  out, st = Open3.capture2e("git", "-C", ROOT, "push", "origin", tag)
+  st.success? ? UI.success("已 push tag #{tag}") : UI.important("push tag 失败（包已上传成功，可稍后手动 push）：\n#{out}")
+end
+
+# ───────────── Android ─────────────
+
+def build_android(bn, opts)
+  pkg = run_unity("android", bn, project_for("android", opts))
+  symbols = pkg.sub(/\.(aab|apk)\z/, ".symbols.zip")
+  symbols = nil unless File.exist?(symbols)
+  UI.success("Android 包：#{pkg}")
+  UI.important("没有生成符号文件，线上崩溃将无法还原堆栈") unless symbols
+  entry = new_entry(bn, pkg, symbols).merge("platform" => "android")
+  save_manifest_entry("android", entry)
+  run_hook("postBuild", "android", entry)
+  entry
+end
+
+def upload_android(entry)
+  a = cfg["android"]
+  UI.user_error!("Google Play 只收 AAB：#{entry['artifact']}") unless entry["artifact"].end_with?(".aab")
+  upload_to_play_store(
+    package_name: a["packageName"], json_key: play_json_key, aab: entry["artifact"],
+    track: a["playTrack"], release_status: a["playReleaseStatus"],
+    skip_upload_metadata: true, skip_upload_images: true,
+    skip_upload_screenshots: true, skip_upload_changelogs: true
+  )
+  UI.success("已上传 Google Play（#{a['playTrack']} 轨道）")
+end
+
+# ───────────── iOS ─────────────
+
+# Xcode 14 起，带资源 bundle 的 Pod（Firebase、各家广告 SDK 常见）要求设置开发团队，
+# 否则报 "Signing for 'xxx' requires a development team"。Podfile 是 Unity / EDM4U 生成的，改不了，
+# 所以在 pod install 之后直接改 Pods 工程。
+def fix_pods_signing(xcode_dir, team)
+  pods = File.join(xcode_dir, "Pods", "Pods.xcodeproj")
+  return unless Dir.exist?(pods)
+  require "xcodeproj"
+  proj = Xcodeproj::Project.open(pods)
+  proj.targets.each do |t|
+    bundle = t.respond_to?(:product_type) && t.product_type == "com.apple.product-type.bundle"
+    t.build_configurations.each do |c|
+      c.build_settings["DEVELOPMENT_TEAM"] = team
+      c.build_settings["CODE_SIGNING_ALLOWED"] = "NO" if bundle
+    end
+  end
+  proj.save
+  UI.message("已设置 Pods 工程的签名团队")
+end
+
+def build_ios(bn, opts)
+  i = cfg["ios"]
+  xcode_dir = run_unity("ios", bn, project_for("ios", opts))
+
+  # 用了带 CocoaPods 依赖的 SDK（Firebase、广告等）时，Unity 会生成 Podfile
+  podfile = File.join(xcode_dir, "Podfile")
+  if File.exist?(podfile)
+    cocoapods(podfile: podfile, try_repo_update_on_error: true)
+    fix_pods_signing(xcode_dir, i["teamId"])
+  end
+  ws = File.join(xcode_dir, "Unity-iPhone.xcworkspace")
+  container = Dir.exist?(ws) ? { workspace: ws } : { project: File.join(xcode_dir, "Unity-iPhone.xcodeproj") }
+
+  # 通过 SSH 打包时登录钥匙串是锁着的，codesign 会失败
+  kc = sec("keychainPassword", "BK_KEYCHAIN_PASSWORD")
+  unlock_keychain(path: "login.keychain", password: kc, set_default: false, add_to_search_list: false) unless kc.empty?
+
+  # 核心：用 API Key 让 Xcode 自动创建/下载证书和描述文件 → 任何一台 Mac 都不用手动装证书
+  auth = [
+    "-allowProvisioningUpdates",
+    "-authenticationKeyPath", kit_path(sec("ascKeyFile", "BK_ASC_KEY_FILE")).shellescape,
+    "-authenticationKeyID", sec("ascKeyId", "BK_ASC_KEY_ID"),
+    "-authenticationKeyIssuerID", sec("ascIssuerId", "BK_ASC_ISSUER_ID")
+  ].join(" ")
+
+  # 每个 build 一个文件夹：ipa + dSYM 放一起，线上崩溃时按 build 号找回对应的符号
+  dir = File.join(out_dir, "iOS", artifact_stem(bn))
+  ipa = build_app(
+    **container,
+    scheme: "Unity-iPhone",
+    configuration: "Release",
+    clean: true,
+    export_method: i["exportMethod"],
+    export_options: { signingStyle: "automatic", teamID: i["teamId"] },
+    xcargs: auth,
+    export_xcargs: auth,
+    output_directory: dir,
+    output_name: "#{safe_name(cfg['productName'])}_#{artifact_stem(bn)}.ipa"
+  )
+  dsym = lane_context[SharedValues::DSYM_OUTPUT_PATH] || Dir[File.join(dir, "*.dSYM.zip")].first
+  dsym = nil unless dsym && File.exist?(dsym)
+  UI.success("iOS 包：#{ipa}")
+  UI.important("没有找到 dSYM，线上崩溃将无法还原堆栈") unless dsym
+  entry = new_entry(bn, ipa, dsym).merge("platform" => "ios")
+  save_manifest_entry("ios", entry)
+  run_hook("postBuild", "ios", entry)
+  entry
+end
+
+def upload_ios(entry)
+  upload_to_testflight(api_key: asc_key, ipa: entry["artifact"], skip_waiting_for_build_processing: true)
+  UI.success("已上传 TestFlight，苹果处理 10~30 分钟后可在 App Store Connect 看到")
+end
+
+# ───────────── 上传 ─────────────
+
+def upload_entry(platform, entry)
+  UI.header("上传 #{platform}：#{entry['artifact']}")
+  UI.user_error!("包文件不存在：#{entry['artifact']}") unless File.exist?(entry["artifact"].to_s)
+  platform == "android" ? upload_android(entry) : upload_ios(entry)
+  entry["uploaded"] = true
+  entry["uploadedAt"] = Time.now.iso8601
+  save_manifest_entry(platform, entry)
+  run_hook("postUpload", platform, entry)
+rescue StandardError => e
+  UI.error("#{platform} 上传失败。包已保存，修好问题后重传即可，不用重新打包：./build.sh upload #{platform}")
+  raise e
+end
+
+# ───────────── 发版主流程 ─────────────
+
+def run_release(opts, android:, ios:)
+  up_android = android && upload?(opts, cfg.dig("android", "uploadToPlay"))
+  if up_android && cfg.dig("android", "format") != "aab"
+    UI.important("android.format 不是 aab，Google Play 只收 AAB，本次不上传")
+    up_android = false
+  end
+  up_ios = ios && upload?(opts, cfg.dig("ios", "uploadToTestFlight"))
+  if up_ios && cfg.dig("ios", "exportMethod") != "app-store"
+    UI.important("ios.exportMethod 是 #{cfg.dig('ios', 'exportMethod')}，只有 app-store 的包能传 TestFlight，本次不上传")
+    up_ios = false
+  end
+
+  preflight(build_android: android, build_ios: ios, upload_android: up_android, upload_ios: up_ios)
+
+  bn = next_build_number(query_play: up_android, query_testflight: up_ios)
+  UI.header("本次 build 号：#{bn}#{android && ios ? '（双端共用）' : ''}")
+
+  # 两端都构建成功后才开始上传：避免一端已经传上去、另一端却没打出来
+  results = {}
+  results["android"] = build_android(bn, opts) if android
+  results["ios"] = build_ios(bn, opts) if ios
+
+  upload_entry("android", results["android"]) if up_android
+  upload_entry("ios", results["ios"]) if up_ios
+  uploaded = results.values.select { |e| e["uploaded"] }
+  tag_release(uploaded) unless uploaded.empty?
+
+  UI.success("全部完成：\n" + results.map { |p, e| "  #{p}: #{e['artifact']}" }.join("\n"))
+  notify(true, "profile「#{profile_name}」：#{summary_line(results)}")
+  results
+end
+
+# ───────────── Lanes ─────────────
+
+before_all do |_lane, options|
+  $bk_profile = options[:profile]
+end
+
+error do |lane, exception, _options|
+  notify(false, "#{lane} 失败：#{exception.message.to_s.lines.first(8).join}")
+end
+
+desc "只检查环境和配置"
+lane :check do
+  preflight(build_android: true, build_ios: MAC,
+            upload_android: cfg.dig("android", "uploadToPlay") && cfg.dig("android", "format") == "aab",
+            upload_ios: MAC && cfg.dig("ios", "uploadToTestFlight"))
+end
+
+desc "双端：先构建 Android 和 iOS，都成功后再统一上传"
+lane :all do |opts|
+  run_release(opts, android: true, ios: true)
+end
+
+desc "重新上传最近一次构建的包（only:android / only:ios，默认两端）"
+lane :upload do |opts|
+  only = (opts[:only] || "all").to_s
+  platforms = only == "all" ? %w[android ios] : [only]
+  UI.user_error!("only 只能是 android / ios / all") unless (platforms - %w[android ios]).empty?
+
+  m = read_manifest
+  todo = platforms.map do |p|
+    e = m[p]
+    if e.nil?
+      UI.user_error!("没有找到 #{p} 的构建记录（#{manifest_path}），请先构建") if only != "all"
+      next
+    end
+    if e["uploaded"] && opts[:force].to_s != "true"
+      UI.important("#{p} build #{e['buildNumber']} 已经上传过（#{e['uploadedAt']}），跳过。确实要重传请加 force:true")
+      next
+    end
+    [p, e]
+  end.compact
+  UI.user_error!("没有需要上传的包") if todo.empty?
+
+  done = []
+  todo.each do |p, e|
+    $bk_profile = e["profile"]   # 按构建时的 profile 取轨道等设置
+    preflight(upload_android: p == "android", upload_ios: p == "ios")
+    upload_entry(p, e)
+    done << e
+  end
+  tag_release(done)
+  notify(true, "重新上传：#{summary_line(done.map { |e| [e['platform'], e] })}")
+end
+
+platform :android do
+  desc "Android：构建 AAB，按配置上传 Google Play"
+  lane :build do |opts|
+    run_release(opts, android: true, ios: false)
+  end
+end
+
+platform :ios do
+  desc "iOS：导出 Xcode 工程 → 签名出 ipa → 按配置上传 TestFlight"
+  lane :build do |opts|
+    run_release(opts, android: false, ios: true)
+  end
+end

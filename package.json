@@ -1,0 +1,23 @@
+{
+  "name": "com.chwuchang.buildkit",
+  "version": "1.0.0",
+  "displayName": "BuildKit",
+  "description": "一键出包并上传 Google Play / App Store 的 Unity 发包套件：配置一次，以后每次一条命令。\nOne-command Android & iOS builds for Unity, with automatic signing and upload to Google Play and TestFlight.",
+  "unity": "2021.3",
+  "documentationUrl": "https://github.com/chwuchang/UnityBuildKit#readme",
+  "changelogUrl": "https://github.com/chwuchang/UnityBuildKit/blob/main/CHANGELOG.md",
+  "licensesUrl": "https://github.com/chwuchang/UnityBuildKit/blob/main/LICENSE",
+  "license": "MIT",
+  "keywords": ["build", "ci", "fastlane", "android", "ios", "google play", "testflight"],
+  "author": {
+    "name": "chwuchang",
+    "url": "https://github.com/chwuchang"
+  },
+  "samples": [
+    {
+      "displayName": "Build Steps",
+      "description": "构建步骤示例：Addressables 构建、EDM4U 依赖解析、写入自定义文件。Example build steps: Addressables, EDM4U resolve, custom files.",
+      "path": "Samples~/BuildSteps"
+    }
+  ]
+}

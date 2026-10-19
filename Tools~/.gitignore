@@ -1,0 +1,8 @@
+# 密码、证书、密钥：绝不提交。换电脑时手动拷贝这个文件夹（或放进密码管理器/私有网盘）
+secrets/
+# fastlane 依赖装在这里，每台电脑自己装
+vendor/
+.bundle/
+logs/
+fastlane/report.xml
+fastlane/README.md

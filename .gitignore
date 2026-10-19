@@ -1,0 +1,7 @@
+# 本仓库本身就是 UPM 包；Unity 的 .meta 文件必须提交（git 安装的包是只读的，缺 .meta 会被忽略）
+.DS_Store
+Thumbs.db
+*.zip
+.idea/
+.vs/
+.vscode/

@@ -1,0 +1,67 @@
+{
+  "productName": "__PRODUCT_NAME__",
+  "companyName": "__COMPANY_NAME__",
+  "version": "__VERSION__",
+  "scenes": [],
+  "outputDir": "Build",
+  "development": false,
+  "defines": [],
+  "embedBuildInfo": true,
+
+  "git": {
+    "requireClean": false,
+    "tagOnUpload": false,
+    "pushTag": false
+  },
+
+  "android": {
+    "packageName": "__ANDROID_PACKAGE__",
+    "format": "aab",
+    "il2cpp": true,
+    "architectures": "ARM64,ARMv7",
+    "minSdk": 0,
+    "targetSdk": 0,
+    "playMinTargetSdk": 36,
+    "keystoreFile": "secrets/release.keystore",
+    "keyAlias": "release",
+    "uploadToPlay": true,
+    "playTrack": "internal",
+    "playReleaseStatus": "draft"
+  },
+
+  "ios": {
+    "bundleId": "__IOS_BUNDLE__",
+    "teamId": "__TEAM_ID__",
+    "minIOS": "13.0",
+    "minXcode": "26.0",
+    "exportMethod": "app-store",
+    "pushNotifications": false,
+    "signInWithApple": false,
+    "usesNonExemptEncryption": false,
+    "privacy": [],
+    "uploadToTestFlight": true
+  },
+
+  "notify": {
+    "onSuccess": true,
+    "onFailure": true
+  },
+
+  "hooks": {
+    "postBuild": "",
+    "postUpload": ""
+  },
+
+  "defaultProfile": "release",
+  "profiles": {
+    "dev": {
+      "development": true,
+      "defines": ["BUILDKIT_DEV"],
+      "android": { "format": "apk", "uploadToPlay": false },
+      "ios": { "exportMethod": "development", "uploadToTestFlight": false }
+    },
+    "release": {
+      "git": { "requireClean": true, "tagOnUpload": true }
+    }
+  }
+}
